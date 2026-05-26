@@ -1,0 +1,122 @@
+# Mavvrik OTel Collector — Datadog variant
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        max_request_body_size: 33554432
+        # Required so headers_setter can read X-Agent-ID from each incoming
+        # request — see the headers_setter extension below.
+        include_metadata: true
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 10
+
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+
+  filter/llm:
+    error_mode: ignore
+    trace_conditions:
+      - >
+        span.attributes["gen_ai.system"] == nil and
+        span.attributes["gen_ai.provider"] == nil and
+        span.attributes["gen_ai.request.model"] == nil and
+        span.attributes["gen_ai.response.model"] == nil and
+        span.attributes["llm.system"] == nil and
+        span.attributes["llm.model_name"] == nil and
+        span.attributes["mvk.model_provider"] == nil
+
+connectors:
+  forward: {}
+  datadog/connector: {}
+
+exporters:
+  otlp_http/mavvrik:
+    endpoint: https://ingest.mavvrik.ai
+    compression: gzip
+    encoding: json
+    timeout: 10s
+    # Mavvrik headers are set by the headers_setter extension below.
+    # Authorization + X-Tenant-ID are static (from env). X-Agent-ID is
+    # forwarded from each incoming OTLP request's X-Agent-ID header so
+    # one collector can serve multiple agents under the same tenant; if
+    # the SDK doesn't set the header, MVK_AGENT_ID is used as a fallback.
+    auth:
+      authenticator: headers_setter
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 120s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
+  datadog/thirdparty:
+    api:
+      key: ${env:DD_API_KEY}
+      site: ${env:DD_SITE}
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /health
+
+  # Builds the outbound Mavvrik headers per request.
+  # Authorization and X-Tenant-ID are operator-managed (from collector env).
+  # X-Agent-ID is forwarded from each incoming request so a single collector
+  # can serve a fleet of agents under one Mavvrik tenant; falls back to
+  # MVK_AGENT_ID if the SDK didn't set X-Agent-ID.
+  headers_setter:
+    headers:
+      - action: upsert
+        key: Authorization
+        value: Bearer ${env:MVK_API_KEY}
+      - action: upsert
+        key: X-Tenant-ID
+        value: ${env:MVK_TENANT_ID}
+      - action: upsert
+        key: X-Agent-ID
+        from_context: x-agent-id
+        default_value: ${env:MVK_AGENT_ID}
+
+service:
+  extensions: [health_check, headers_setter]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection]
+      exporters: [forward]
+
+    # Mavvrik leg — applies the LLM-only filter so Mavvrik only sees spans
+    # it cares about. Non-LLM spans are NOT dropped from the Datadog leg.
+    traces/mavvrik:
+      receivers: [forward]
+      processors: [filter/llm]
+      exporters: [otlp_http/mavvrik]
+
+    # Datadog stats pipeline — receives ALL spans so APM RED metrics
+    # are computed over the full trace, not just the LLM portion.
+    traces/datadog_stats:
+      receivers: [forward]
+      exporters: [datadog/connector]
+
+    traces/datadog_export:
+      receivers: [datadog/connector]
+      exporters: [datadog/thirdparty]
+
+  telemetry:
+    logs:
+      level: ${env:LOG_LEVEL}
+      encoding: json

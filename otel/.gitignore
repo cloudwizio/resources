@@ -1,0 +1,5 @@
+# Secrets — never commit
+.env
+
+# Local persistent-queue mount (see docs/PRODUCTION.md)
+queue/
